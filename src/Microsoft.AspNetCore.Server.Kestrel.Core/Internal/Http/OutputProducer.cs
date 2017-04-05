@@ -172,7 +172,12 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http
 
                 var buffer = _pipe.Alloc();
                 callback(buffer, state);
+
+                // Super hack
+                _pendingBytes += buffer.BytesWritten;
+
                 buffer.Commit();
+
             }
         }
 
