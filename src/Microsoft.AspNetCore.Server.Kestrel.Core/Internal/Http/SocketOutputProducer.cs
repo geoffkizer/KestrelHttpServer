@@ -79,7 +79,15 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Internal.Http
                 writableBuffer.Commit();
             }
 
-            return FlushAsync(writableBuffer);
+            // Super hack
+            if (writableBuffer.BytesWritten == 2112)
+            {
+                return FlushAsync(writableBuffer);
+            }
+            else
+            {
+                return Task.CompletedTask;
+            }
         }
 
         private Task FlushAsync(WritableBuffer writableBuffer)
