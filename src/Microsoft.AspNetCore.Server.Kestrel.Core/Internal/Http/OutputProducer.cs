@@ -33,6 +33,9 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http
         private readonly object _flushLock = new object();
         private readonly Action _onFlushCallback;
 
+        // Hack
+        private int _pendingBytes = 0;
+
         public OutputProducer(IPipeWriter pipe, Frame frame, string connectionId, IKestrelTrace log)
         {
             _pipe = pipe;
@@ -80,8 +83,10 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http
             }
 
             // Super hack
-            if (writableBuffer.BytesWritten == 2112)
+            _pendingBytes += buffer.Count;
+            if (_pendingBytes == 2112)
             {
+                _pendingBytes = 0;
                 return FlushAsync(writableBuffer);
             }
             else
