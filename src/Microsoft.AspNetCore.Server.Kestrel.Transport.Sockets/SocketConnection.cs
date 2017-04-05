@@ -172,9 +172,11 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets
 
         public PipeFactory PipeFactory => _transport.PipeFactory;
 
-        public IScheduler InputWriterScheduler => InlineScheduler.Default;
+        //       public IScheduler InputWriterScheduler => InlineScheduler.Default;
+        public IScheduler InputWriterScheduler => TaskRunScheduler.Default;
 
-        public IScheduler OutputWriterScheduler => InlineScheduler.Default;
+        //        public IScheduler OutputWriterScheduler => InlineScheduler.Default;
+        public IScheduler OutputWriterScheduler => TaskRunScheduler.Default;
 
         public ITimeoutControl TimeoutControl => this;
     }
