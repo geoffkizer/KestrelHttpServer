@@ -96,7 +96,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal
         internal static PipeOptions GetOutputPipeOptions(ServiceContext serviceContext, MemoryPool<byte> memoryPool, PipeScheduler readerScheduler) => new PipeOptions
         (
             pool: memoryPool,
-            readerScheduler: readerScheduler,
+//            readerScheduler: readerScheduler,
+            readerScheduler: PipeScheduler.Inline,
             writerScheduler: serviceContext.ThreadPool,
             pauseWriterThreshold: GetOutputResponseBufferSize(serviceContext),
             resumeWriterThreshold: GetOutputResponseBufferSize(serviceContext),
