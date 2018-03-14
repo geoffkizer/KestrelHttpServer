@@ -4,11 +4,10 @@
 using System;
 using System.Buffers;
 using System.Diagnostics;
-using System.IO;
 using System.IO.Pipelines;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Server.Kestrel.Transport.Abstractions.Internal;
@@ -16,18 +15,14 @@ using Microsoft.Extensions.Logging;
 
 namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
 {
-    internal sealed class SocketConnection : TransportConnection
+    internal sealed class SocketConnection : TransportConnection, IConnectionTransportFeature
     {
         private const int MinAllocBufferSize = 2048;
-        public readonly static bool IsWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
         private readonly Socket _socket;
-        private readonly PipeScheduler _scheduler;
         private readonly ISocketsTrace _trace;
-        private readonly SocketReceiver _receiver;
-        private readonly SocketSender _sender;
 
-        private volatile bool _aborted;
+        private readonly IDuplexPipe _transportPipes;
 
         internal SocketConnection(Socket socket, MemoryPool<byte> memoryPool, PipeScheduler scheduler, ISocketsTrace trace)
         {
@@ -37,7 +32,6 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
 
             _socket = socket;
             MemoryPool = memoryPool;
-            _scheduler = scheduler;
             _trace = trace;
 
             var localEndPoint = (IPEndPoint)_socket.LocalEndPoint;
@@ -49,210 +43,185 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
             RemoteAddress = remoteEndPoint.Address;
             RemotePort = remoteEndPoint.Port;
 
-            // On *nix platforms, Sockets already dispatches to the ThreadPool.
-            var awaiterScheduler = IsWindows ? _scheduler : PipeScheduler.Inline;
-
-            _receiver = new SocketReceiver(_socket, awaiterScheduler);
-            _sender = new SocketSender(_socket, awaiterScheduler);
+            var pipeReader = new SocketPipeReader(this);
+            var pipeWriter = new SocketPipeWriter(this);
+            _transportPipes = new DuplexPipe(pipeReader, pipeWriter);
         }
 
         public override MemoryPool<byte> MemoryPool { get; }
-        public override PipeScheduler InputWriterScheduler => _scheduler;
-        public override PipeScheduler OutputReaderScheduler => _scheduler;
 
         public async Task StartAsync(IConnectionDispatcher connectionDispatcher)
         {
-            Exception sendError = null;
             try
             {
                 connectionDispatcher.OnConnection(this);
 
-                // Spawn send and receive logic
-                Task receiveTask = DoReceive();
-                Task<Exception> sendTask = DoSend();
-
-                // If the sending task completes then close the receive
-                // We don't need to do this in the other direction because the kestrel
-                // will trigger the output closing once the input is complete.
-                if (await Task.WhenAny(receiveTask, sendTask) == sendTask)
-                {
-                    // Tell the reader it's being aborted
-                    _socket.Dispose();
-                }
-
-                // Now wait for both to complete
-                await receiveTask;
-                sendError = await sendTask;
-
-                // Dispose the socket(should noop if already called)
-                _socket.Dispose();
+                // TODO: Handle connection shutdown
+                await Task.Delay(-1);
             }
             catch (Exception ex)
             {
                 _trace.LogError(0, ex, $"Unexpected exception in {nameof(SocketConnection)}.{nameof(StartAsync)}.");
             }
-            finally
+        }
+
+        IDuplexPipe IConnectionTransportFeature.Transport
+        {
+            get => _transportPipes;
+            set { }
+        }
+
+        private const int BufferSize = 4096;
+
+        sealed class SocketPipeReader : PipeReader
+        {
+            private readonly SocketConnection _socketConnection;
+            private readonly Memory<byte> _readBuffer;
+            private int _readStart;
+            private int _readEnd;
+
+            public SocketPipeReader(SocketConnection socketConnection)
             {
-                // Complete the output after disposing the socket
-                Output.Complete(sendError);
+                _socketConnection = socketConnection;
+
+                _readBuffer = _socketConnection.MemoryPool.Rent(BufferSize).Memory;
+            }
+
+            public override void AdvanceTo(SequencePosition consumed)
+            {
+                AdvanceTo(consumed, consumed);
+            }
+
+            public override void AdvanceTo(SequencePosition consumed, SequencePosition examined)
+            {
+                int offset = consumed.GetInteger();
+
+                if (offset + _readStart > _readEnd)
+                {
+                    throw new InvalidOperationException("SocketPipeReader.AdvanceTo past _readEnd");
+                }
+
+                _readStart += offset;
+                if (_readStart == _readEnd)
+                {
+                    _readStart = 0;
+                    _readEnd = 0;
+                }
+            }
+
+            public override void CancelPendingRead()
+            {
+//                throw new NotImplementedException();
+            }
+
+            public override void Complete(Exception exception = null)
+            {
+                // TODO: Shutdown
+            }
+
+            public override void OnWriterCompleted(Action<Exception, object> callback, object state)
+            {
+                // TODO
+            }
+
+            public override async ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken = default)
+            {
+                Memory<byte> availableBuffer = _readBuffer.Slice(_readEnd);
+                if (availableBuffer.Length == 0)
+                {
+                    throw new NotSupportedException("Out of buffer space");
+                }
+
+                int bytesRead = await _socketConnection._socket.ReceiveAsync(availableBuffer, SocketFlags.None);
+                if (bytesRead == 0)
+                {
+                    return new ReadResult(default(ReadOnlySequence<byte>), false, true);
+                }
+
+                _readEnd += bytesRead;
+                return new ReadResult(new ReadOnlySequence<byte>(_readBuffer.Slice(_readStart, _readEnd - _readStart)), false, false);
+            }
+
+            public override bool TryRead(out ReadResult result)
+            {
+                ReadOnlyMemory<byte> readBytes = _readBuffer.Slice(_readStart, _readEnd - _readStart);
+                if (readBytes.Length == 0)
+                {
+                    result = default;
+                    return false;
+                }
+
+                result = new ReadResult(new ReadOnlySequence<byte>(readBytes), false, false);
+                return true;
             }
         }
 
-        private async Task DoReceive()
+        sealed class SocketPipeWriter : PipeWriter
         {
-            Exception error = null;
+            private SocketConnection _socketConnection;
+            private readonly Memory<byte> _writeBuffer;
+            private int _writeEnd;
 
-            try
+            public SocketPipeWriter(SocketConnection socketConnection)
             {
-                await ProcessReceives();
+                _socketConnection = socketConnection;
+
+                _writeBuffer = _socketConnection.MemoryPool.Rent(BufferSize).Memory;
             }
-            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)
+
+            public override void Advance(int bytes)
             {
-                error = new ConnectionResetException(ex.Message, ex);
-                _trace.ConnectionReset(ConnectionId);
-            }
-            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.OperationAborted ||
-                                             ex.SocketErrorCode == SocketError.ConnectionAborted ||
-                                             ex.SocketErrorCode == SocketError.Interrupted ||
-                                             ex.SocketErrorCode == SocketError.InvalidArgument)
-            {
-                if (!_aborted)
+                if (_writeEnd + bytes > _writeBuffer.Length)
                 {
-                    // Calling Dispose after ReceiveAsync can cause an "InvalidArgument" error on *nix.
-                    error = new ConnectionAbortedException();
-                    _trace.ConnectionError(ConnectionId, error);
-                }
-            }
-            catch (ObjectDisposedException)
-            {
-                if (!_aborted)
-                {
-                    error = new ConnectionAbortedException();
-                    _trace.ConnectionError(ConnectionId, error);
-                }
-            }
-            catch (IOException ex)
-            {
-                error = ex;
-                _trace.ConnectionError(ConnectionId, error);
-            }
-            catch (Exception ex)
-            {
-                error = new IOException(ex.Message, ex);
-                _trace.ConnectionError(ConnectionId, error);
-            }
-            finally
-            {
-                if (_aborted)
-                {
-                    error = error ?? new ConnectionAbortedException();
+                    throw new InvalidOperationException("Advance past end of buffer");
                 }
 
-                Input.Complete(error);
+                _writeEnd += bytes;
             }
-        }
 
-        private async Task ProcessReceives()
-        {
-            while (true)
+            public override void CancelPendingFlush()
             {
-                // Ensure we have some reasonable amount of buffer space
-                var buffer = Input.GetMemory(MinAllocBufferSize);
+                // TODO
+            }
 
-                var bytesReceived = await _receiver.ReceiveAsync(buffer);
+            public override void Complete(Exception exception = null)
+            {
+                // TODO
+            }
 
-                if (bytesReceived == 0)
+            public override async ValueTask<FlushResult> FlushAsync(CancellationToken cancellationToken = default)
+            {
+                if (_writeEnd == 0)
                 {
-                    // FIN
-                    _trace.ConnectionReadFin(ConnectionId);
-                    break;
+                    return new FlushResult(false, false);
                 }
 
-                Input.Advance(bytesReceived);
+                await _socketConnection._socket.SendAsync(_writeBuffer.Slice(0, _writeEnd), SocketFlags.None);
 
-                var flushTask = Input.FlushAsync();
+                _writeEnd = 0;
+                return new FlushResult(false, false);
+            }
 
-                if (!flushTask.IsCompleted)
+            public override Memory<byte> GetMemory(int sizeHint = 0)
+            {
+                Memory<byte> availableBuffer = _writeBuffer.Slice(_writeEnd);
+
+                if (availableBuffer.Length < sizeHint)
                 {
-                    _trace.ConnectionPause(ConnectionId);
-
-                    await flushTask;
-
-                    _trace.ConnectionResume(ConnectionId);
+                    throw new NotSupportedException("Out of buffer space");
                 }
 
-                var result = flushTask.GetAwaiter().GetResult();
-                if (result.IsCompleted)
-                {
-                    // Pipe consumer is shut down, do we stop writing
-                    break;
-                }
-            }
-        }
-
-        private async Task<Exception> DoSend()
-        {
-            Exception error = null;
-
-            try
-            {
-                await ProcessSends();
-            }
-            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.OperationAborted)
-            {
-                error = null;
-            }
-            catch (ObjectDisposedException)
-            {
-                error = null;
-            }
-            catch (IOException ex)
-            {
-                error = ex;
-            }
-            catch (Exception ex)
-            {
-                error = new IOException(ex.Message, ex);
-            }
-            finally
-            {
-                // Make sure to close the connection only after the _aborted flag is set.
-                // Without this, the RequestsCanBeAbortedMidRead test will sometimes fail when
-                // a BadHttpRequestException is thrown instead of a TaskCanceledException.
-                _aborted = true;
-                _trace.ConnectionWriteFin(ConnectionId);
-                _socket.Shutdown(SocketShutdown.Both);
+                return availableBuffer;
             }
 
-            return error;
-        }
-
-        private async Task ProcessSends()
-        {
-            while (true)
+            public override Span<byte> GetSpan(int sizeHint = 0)
             {
-                // Wait for data to write from the pipe producer
-                var result = await Output.ReadAsync();
-                var buffer = result.Buffer;
+                return GetMemory(sizeHint).Span;
+            }
 
-                if (result.IsCanceled)
-                {
-                    break;
-                }
-
-                var end = buffer.End;
-                var isCompleted = result.IsCompleted;
-                if (!buffer.IsEmpty)
-                {
-                    await _sender.SendAsync(buffer);
-                }
-
-                Output.AdvanceTo(end);
-
-                if (isCompleted)
-                {
-                    break;
-                }
+            public override void OnReaderCompleted(Action<Exception, object> callback, object state)
+            {
+                // TODO
             }
         }
     }
