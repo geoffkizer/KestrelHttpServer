@@ -9,6 +9,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Threading.Tasks.Sources;
 using Microsoft.AspNetCore.Connections.Features;
 using Microsoft.AspNetCore.Server.Kestrel.Transport.Abstractions.Internal;
 using Microsoft.Extensions.Logging;
@@ -80,6 +81,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
             private int _readStart;
             private int _readEnd;
 
+            private static readonly BatchScheduler s_batchScheduler = new BatchScheduler();
+
             public SocketPipeReader(SocketConnection socketConnection)
             {
                 _socketConnection = socketConnection;
@@ -133,6 +136,10 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
                 }
 
                 int bytesRead = await _socketConnection._socket.ReceiveAsync(availableBuffer, SocketFlags.None);
+
+                // Force rest of continuation to be executed in batch
+                await s_batchScheduler.BatchAsync();
+
                 if (bytesRead == 0)
                 {
                     return new ReadResult(default(ReadOnlySequence<byte>), false, true);
@@ -223,6 +230,52 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
             {
                 // TODO
             }
+        }
+    }
+
+    sealed class BatchScheduler
+    {
+        private const int BatchSize = 8;
+
+        private readonly object _lockObj;
+        private TaskCompletionSource<bool>[] _batchItems;
+        private int _itemCount;
+
+        public BatchScheduler()
+        {
+            _lockObj = new object();
+            _batchItems = new TaskCompletionSource<bool>[BatchSize];
+            _itemCount = 0;
+        }
+
+        public Task BatchAsync()
+        {
+            TaskCompletionSource<bool> source = new TaskCompletionSource<bool>();
+
+            TaskCompletionSource<bool>[] batchToExecute = null;
+
+            lock (_lockObj)
+            {
+                _batchItems[_itemCount] = source;
+                _itemCount++;
+
+                if (_itemCount == BatchSize)
+                {
+                    batchToExecute = _batchItems;
+                    _batchItems = new TaskCompletionSource<bool>[BatchSize];
+                    _itemCount = 0;
+                }
+            }
+
+            if (batchToExecute != null)
+            {
+                for (int i = 0; i < BatchSize; i++)
+                {
+                    _batchItems[i].SetResult(true);
+                }
+            }
+
+            return source.Task;
         }
     }
 }
