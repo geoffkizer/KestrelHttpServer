@@ -240,12 +240,18 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
         private readonly object _lockObj;
         private TaskCompletionSource<bool>[] _batchItems;
         private int _itemCount;
+        private readonly Timer _timer;
 
         public BatchScheduler()
         {
             _lockObj = new object();
             _batchItems = new TaskCompletionSource<bool>[BatchSize];
             _itemCount = 0;
+
+            _timer = new Timer((s) =>
+            {
+                TimerCallback();
+            }, null, 100, 100);
         }
 
         public Task BatchAsync()
@@ -271,11 +277,37 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
             {
                 for (int i = 0; i < BatchSize; i++)
                 {
-                    _batchItems[i].SetResult(true);
+                    batchToExecute[i].SetResult(true);
                 }
             }
 
             return source.Task;
+        }
+
+        private void TimerCallback()
+        {
+            TaskCompletionSource<bool>[] batchToExecute = null;
+            int itemCount = 0;
+
+            lock (_lockObj)
+            {
+                if (_itemCount > 0)
+                {
+                    batchToExecute = _batchItems;
+                    itemCount = _itemCount;
+
+                    _batchItems = new TaskCompletionSource<bool>[BatchSize];
+                    _itemCount = 0;
+                }
+            }
+
+            if (batchToExecute != null)
+            {
+                for (int i = 0; i < itemCount; i++)
+                {
+                    batchToExecute[i].SetResult(true);
+                }
+            }
         }
     }
 }
