@@ -80,11 +80,15 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
             private int _readStart;
             private int _readEnd;
 
+            private readonly IOCPScheduler _iocpScheduler;
+
             public SocketPipeReader(SocketConnection socketConnection)
             {
                 _socketConnection = socketConnection;
 
                 _readBuffer = _socketConnection.MemoryPool.Rent(BufferSize).Memory;
+
+                _iocpScheduler = new IOCPScheduler();
             }
 
             public override void AdvanceTo(SequencePosition consumed)
@@ -126,6 +130,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
 
             public override async ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken = default)
             {
+                await _iocpScheduler.QueueToIOThreadAsync();
+
                 Memory<byte> availableBuffer = _readBuffer.Slice(_readEnd);
                 if (availableBuffer.Length == 0)
                 {
@@ -223,6 +229,48 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
             {
                 // TODO
             }
+        }
+    }
+
+    // TODO: Should be IDisposable
+    sealed unsafe class IOCPScheduler
+    {
+        private readonly Overlapped _overlapped;
+        private readonly NativeOverlapped* _nativeOverlapped;
+        private TaskCompletionSource<bool> _completionSource;
+
+        public IOCPScheduler()
+        {
+            _overlapped = new Overlapped();
+            _nativeOverlapped = _overlapped.Pack(IOCompletionCallback, null);
+        }
+
+        public Task QueueToIOThreadAsync()
+        {
+            if (_completionSource != null)
+            {
+                // Only one operation can be queued at a time
+                throw new InvalidOperationException();
+            }
+
+            _completionSource = new TaskCompletionSource<bool>();
+
+            ThreadPool.UnsafeQueueNativeOverlapped(_nativeOverlapped);
+
+            return _completionSource.Task;
+        }
+
+        private void IOCompletionCallback(uint errorCode, uint bytes, NativeOverlapped* nativeOverlapped)
+        {
+            if (_completionSource == null)
+            {
+                // Unexpected callback without continuation
+                throw new InvalidOperationException();
+            }
+
+            var completionSource = _completionSource;
+            _completionSource = null;
+            completionSource.SetResult(true);
         }
     }
 }
