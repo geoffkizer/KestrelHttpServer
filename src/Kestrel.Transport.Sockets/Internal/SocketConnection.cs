@@ -13,6 +13,9 @@ using Microsoft.AspNetCore.Connections.Features;
 using Microsoft.AspNetCore.Server.Kestrel.Transport.Abstractions.Internal;
 using Microsoft.Extensions.Logging;
 
+ 
+using System.Runtime.CompilerServices;
+
 namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
 {
     internal sealed class SocketConnection : TransportConnection, IConnectionTransportFeature
@@ -80,7 +83,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
             private int _readStart;
             private int _readEnd;
 
-            private readonly IOCPScheduler _iocpScheduler;
+            private readonly IOCPAwaitable _iocpAwaitable;
 
             public SocketPipeReader(SocketConnection socketConnection)
             {
@@ -88,7 +91,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
 
                 _readBuffer = _socketConnection.MemoryPool.Rent(BufferSize).Memory;
 
-                _iocpScheduler = new IOCPScheduler();
+                _iocpAwaitable = new IOCPAwaitable();
             }
 
             public override void AdvanceTo(SequencePosition consumed)
@@ -130,7 +133,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
 
             public override async ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken = default)
             {
-                await _iocpScheduler.QueueToIOThreadAsync();
+                await _iocpAwaitable;
 
                 Memory<byte> availableBuffer = _readBuffer.Slice(_readEnd);
                 if (availableBuffer.Length == 0)
@@ -233,44 +236,54 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
     }
 
     // TODO: Should be IDisposable
-    sealed unsafe class IOCPScheduler
+    sealed unsafe class IOCPAwaitable : ICriticalNotifyCompletion
     {
         private readonly Overlapped _overlapped;
         private readonly NativeOverlapped* _nativeOverlapped;
-        private TaskCompletionSource<bool> _completionSource;
+        private Action _continuation;
 
-        public IOCPScheduler()
+        public IOCPAwaitable()
         {
             _overlapped = new Overlapped();
             _nativeOverlapped = _overlapped.Pack(IOCompletionCallback, null);
         }
 
-        public Task QueueToIOThreadAsync()
+        public IOCPAwaitable GetAwaiter() => this;
+        public bool IsCompleted => false;
+
+        public void GetResult()
         {
-            if (_completionSource != null)
+        }
+
+        public void OnCompleted(Action continuation)
+        {
+            UnsafeOnCompleted(continuation);
+        }
+
+        public void UnsafeOnCompleted(Action continuation)
+        {
+            if (_continuation != null)
             {
-                // Only one operation can be queued at a time
+                // Only one operation at a time
                 throw new InvalidOperationException();
             }
 
-            _completionSource = new TaskCompletionSource<bool>();
+            _continuation = continuation;
 
             ThreadPool.UnsafeQueueNativeOverlapped(_nativeOverlapped);
-
-            return _completionSource.Task;
         }
 
         private void IOCompletionCallback(uint errorCode, uint bytes, NativeOverlapped* nativeOverlapped)
         {
-            if (_completionSource == null)
+            if (_continuation == null)
             {
                 // Unexpected callback without continuation
                 throw new InvalidOperationException();
             }
 
-            var completionSource = _completionSource;
-            _completionSource = null;
-            completionSource.SetResult(true);
+            var continuation = _continuation;
+            _continuation = null;
+            continuation();
         }
     }
 }
