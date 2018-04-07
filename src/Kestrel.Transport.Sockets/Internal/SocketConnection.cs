@@ -83,7 +83,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
             private int _readStart;
             private int _readEnd;
 
-            private readonly IOCPAwaitable _iocpAwaitable;
+            private readonly ThreadPoolAwaitable _awaitable;
 
             public SocketPipeReader(SocketConnection socketConnection)
             {
@@ -91,7 +91,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
 
                 _readBuffer = _socketConnection.MemoryPool.Rent(BufferSize).Memory;
 
-                _iocpAwaitable = new IOCPAwaitable();
+                _awaitable = new ThreadPoolAwaitable();
             }
 
             public override void AdvanceTo(SequencePosition consumed)
@@ -133,7 +133,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
 
             public override async ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken = default)
             {
-                await _iocpAwaitable;
+                await _awaitable;
 
                 Memory<byte> availableBuffer = _readBuffer.Slice(_readEnd);
                 if (availableBuffer.Length == 0)
@@ -141,7 +141,20 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
                     throw new NotSupportedException("Out of buffer space");
                 }
 
-                int bytesRead = await _socketConnection._socket.ReceiveAsync(availableBuffer, SocketFlags.None);
+                ValueTask<int> receiveTask = _socketConnection._socket.ReceiveAsync(availableBuffer, SocketFlags.None);
+                bool needDispatch = false;
+                if (!receiveTask.IsCompleted)
+                {
+                    // Receive task is going to complete on an IO thread, so we need to dispatch back to where we want to be.
+                    needDispatch = true;
+                }
+
+                int bytesRead = await receiveTask;
+                if (needDispatch)
+                {
+                    await _awaitable;
+                }
+
                 if (bytesRead == 0)
                 {
                     return new ReadResult(default(ReadOnlySequence<byte>), false, true);
@@ -236,19 +249,15 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
     }
 
     // TODO: Should be IDisposable
-    sealed unsafe class IOCPAwaitable : ICriticalNotifyCompletion
+    sealed unsafe class ThreadPoolAwaitable : ICriticalNotifyCompletion
     {
-        private readonly Overlapped _overlapped;
-        private readonly NativeOverlapped* _nativeOverlapped;
         private Action _continuation;
 
-        public IOCPAwaitable()
+        public ThreadPoolAwaitable()
         {
-            _overlapped = new Overlapped();
-            _nativeOverlapped = _overlapped.Pack(IOCompletionCallback, null);
         }
 
-        public IOCPAwaitable GetAwaiter() => this;
+        public ThreadPoolAwaitable GetAwaiter() => this;
         public bool IsCompleted => false;
 
         public void GetResult()
@@ -270,10 +279,12 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
 
             _continuation = continuation;
 
-            ThreadPool.UnsafeQueueNativeOverlapped(_nativeOverlapped);
+            ThreadPool.QueueUserWorkItem(s_ThreadPoolCallback, this);
         }
 
-        private void IOCompletionCallback(uint errorCode, uint bytes, NativeOverlapped* nativeOverlapped)
+        private static readonly WaitCallback s_ThreadPoolCallback = s => ((ThreadPoolAwaitable)s).ThreadPoolCallback();
+
+        private void ThreadPoolCallback()
         {
             if (_continuation == null)
             {
