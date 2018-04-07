@@ -145,6 +145,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets
         {
             try
             {
+                CustomThreadPool threadPool = new CustomThreadPool(Environment.ProcessorCount);
+
                 while (true)
                 {
                     for (var schedulerIndex = 0; schedulerIndex < _numSchedulers;  schedulerIndex++)
@@ -154,7 +156,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets
                             var acceptSocket = await _listenSocket.AcceptAsync();
                             acceptSocket.NoDelay = _endPointInformation.NoDelay;
 
-                            var connection = new SocketConnection(acceptSocket, _memoryPool, _schedulers[schedulerIndex], _trace);
+                            var connection = new SocketConnection(acceptSocket, _memoryPool, _schedulers[schedulerIndex], _trace, threadPool);
                             _ = connection.StartAsync(_dispatcher);
                         }
                         catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)

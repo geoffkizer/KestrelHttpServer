@@ -15,6 +15,7 @@ using Microsoft.Extensions.Logging;
 
  
 using System.Runtime.CompilerServices;
+using System.Collections.Concurrent;
 
 namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
 {
@@ -27,7 +28,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
 
         private readonly IDuplexPipe _transportPipes;
 
-        internal SocketConnection(Socket socket, MemoryPool<byte> memoryPool, PipeScheduler scheduler, ISocketsTrace trace)
+        internal SocketConnection(Socket socket, MemoryPool<byte> memoryPool, PipeScheduler scheduler, ISocketsTrace trace, CustomThreadPool threadPool)
         {
             Debug.Assert(socket != null);
             Debug.Assert(memoryPool != null);
@@ -36,6 +37,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
             _socket = socket;
             MemoryPool = memoryPool;
             _trace = trace;
+            ThreadPool = threadPool;
 
             var localEndPoint = (IPEndPoint)_socket.LocalEndPoint;
             var remoteEndPoint = (IPEndPoint)_socket.RemoteEndPoint;
@@ -52,6 +54,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
         }
 
         public override MemoryPool<byte> MemoryPool { get; }
+        public CustomThreadPool ThreadPool { get; }
 
         public async Task StartAsync(IConnectionDispatcher connectionDispatcher)
         {
@@ -83,7 +86,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
             private int _readStart;
             private int _readEnd;
 
-            private readonly ThreadPoolAwaitable _awaitable;
+            private readonly CustomThreadPoolAwaitable _awaitable;
 
             public SocketPipeReader(SocketConnection socketConnection)
             {
@@ -91,7 +94,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
 
                 _readBuffer = _socketConnection.MemoryPool.Rent(BufferSize).Memory;
 
-                _awaitable = new ThreadPoolAwaitable();
+                _awaitable = new CustomThreadPoolAwaitable(socketConnection.ThreadPool);
             }
 
             public override void AdvanceTo(SequencePosition consumed)
@@ -248,16 +251,48 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
         }
     }
 
-    // TODO: Should be IDisposable
-    sealed unsafe class ThreadPoolAwaitable : ICriticalNotifyCompletion
+    sealed class CustomThreadPool
     {
-        private Action _continuation;
+        private readonly BlockingCollection<Action> _workQueue;
 
-        public ThreadPoolAwaitable()
+        public CustomThreadPool(int threadCount)
         {
+            _workQueue = new BlockingCollection<Action>(new ConcurrentQueue<Action>());
+
+            for (int i = 0; i < threadCount; i++)
+            {
+                var t = new Thread(RunThread);
+                t.Start();
+            }
         }
 
-        public ThreadPoolAwaitable GetAwaiter() => this;
+        private void RunThread()
+        {
+            while (true)
+            {
+                Action workItem = _workQueue.Take();
+
+                workItem();
+            }
+        }
+
+        public void QueueWorkItem(Action workItem)
+        {
+            _workQueue.Add(workItem);
+        }
+    }
+
+    // TODO: Should be IDisposable
+    sealed class CustomThreadPoolAwaitable : ICriticalNotifyCompletion
+    {
+        private readonly CustomThreadPool _threadPool;
+
+        public CustomThreadPoolAwaitable(CustomThreadPool threadPool)
+        {
+            _threadPool = threadPool;
+        }
+
+        public CustomThreadPoolAwaitable GetAwaiter() => this;
         public bool IsCompleted => false;
 
         public void GetResult()
@@ -271,30 +306,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
 
         public void UnsafeOnCompleted(Action continuation)
         {
-            if (_continuation != null)
-            {
-                // Only one operation at a time
-                throw new InvalidOperationException();
-            }
-
-            _continuation = continuation;
-
-            ThreadPool.QueueUserWorkItem(s_ThreadPoolCallback, this);
-        }
-
-        private static readonly WaitCallback s_ThreadPoolCallback = s => ((ThreadPoolAwaitable)s).ThreadPoolCallback();
-
-        private void ThreadPoolCallback()
-        {
-            if (_continuation == null)
-            {
-                // Unexpected callback without continuation
-                throw new InvalidOperationException();
-            }
-
-            var continuation = _continuation;
-            _continuation = null;
-            continuation();
+            _threadPool.QueueWorkItem(continuation);
         }
     }
 }
