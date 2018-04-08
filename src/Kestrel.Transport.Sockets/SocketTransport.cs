@@ -28,6 +28,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets
         private readonly IApplicationLifetime _appLifetime;
         private readonly int _numSchedulers;
         private readonly PipeScheduler[] _schedulers;
+        private readonly CustomThreadPool[] _customThreadPools;
         private readonly ISocketsTrace _trace;
         private Socket _listenSocket;
         private Task _listenTask;
@@ -60,6 +61,13 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets
                 for (var i = 0; i < _numSchedulers; i++)
                 {
                     _schedulers[i] = new IOQueue();
+                }
+
+                _customThreadPools = new CustomThreadPool[_numSchedulers];
+
+                for (var i = 0; i < _numSchedulers; i++)
+                {
+                    _customThreadPools[i] = new CustomThreadPool(1);
                 }
             }
             else
@@ -145,8 +153,6 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets
         {
             try
             {
-                CustomThreadPool threadPool = new CustomThreadPool(Environment.ProcessorCount);
-
                 while (true)
                 {
                     for (var schedulerIndex = 0; schedulerIndex < _numSchedulers;  schedulerIndex++)
@@ -156,7 +162,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets
                             var acceptSocket = await _listenSocket.AcceptAsync();
                             acceptSocket.NoDelay = _endPointInformation.NoDelay;
 
-                            var connection = new SocketConnection(acceptSocket, _memoryPool, _schedulers[schedulerIndex], _trace, threadPool);
+                            var connection = new SocketConnection(acceptSocket, _memoryPool, _schedulers[schedulerIndex], _trace, _customThreadPools[schedulerIndex]);
                             _ = connection.StartAsync(_dispatcher);
                         }
                         catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)
