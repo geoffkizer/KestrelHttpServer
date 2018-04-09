@@ -60,8 +60,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
         }
 
         public override MemoryPool<byte> MemoryPool { get; }
-        public override PipeScheduler InputWriterScheduler => _scheduler.IOCompletionScheduler;
-        public override PipeScheduler OutputReaderScheduler => _scheduler.IOCompletionScheduler;
+        public override PipeScheduler InputWriterScheduler => PipeScheduler.Inline;
+        public override PipeScheduler OutputReaderScheduler => PipeScheduler.Inline;
         
         public async Task StartAsync(IConnectionDispatcher connectionDispatcher)
         {
