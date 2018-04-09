@@ -3,12 +3,15 @@
 
 using System;
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipelines;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Server.Kestrel.Transport.Abstractions.Internal;
@@ -22,14 +25,14 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
         public readonly static bool IsWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
         private readonly Socket _socket;
-        private readonly PipeScheduler _scheduler;
+        private readonly SocketScheduler _scheduler;
         private readonly ISocketsTrace _trace;
         private readonly SocketReceiver _receiver;
         private readonly SocketSender _sender;
 
         private volatile bool _aborted;
 
-        internal SocketConnection(Socket socket, MemoryPool<byte> memoryPool, PipeScheduler scheduler, ISocketsTrace trace)
+        internal SocketConnection(Socket socket, MemoryPool<byte> memoryPool, SocketScheduler scheduler, ISocketsTrace trace)
         {
             Debug.Assert(socket != null);
             Debug.Assert(memoryPool != null);
@@ -50,16 +53,16 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
             RemotePort = remoteEndPoint.Port;
 
             // On *nix platforms, Sockets already dispatches to the ThreadPool.
-            var awaiterScheduler = IsWindows ? _scheduler : PipeScheduler.Inline;
+            var awaiterScheduler = IsWindows ? _scheduler.IOCompletionScheduler : PipeScheduler.Inline;
 
             _receiver = new SocketReceiver(_socket, awaiterScheduler);
             _sender = new SocketSender(_socket, awaiterScheduler);
         }
 
         public override MemoryPool<byte> MemoryPool { get; }
-        public override PipeScheduler InputWriterScheduler => _scheduler;
-        public override PipeScheduler OutputReaderScheduler => _scheduler;
-
+        public override PipeScheduler InputWriterScheduler => _scheduler.IOCompletionScheduler;
+        public override PipeScheduler OutputReaderScheduler => _scheduler.IOCompletionScheduler;
+        
         public async Task StartAsync(IConnectionDispatcher connectionDispatcher)
         {
             Exception sendError = null;
@@ -159,6 +162,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
                 // Ensure we have some reasonable amount of buffer space
                 var buffer = Input.GetMemory(MinAllocBufferSize);
 
+                await _scheduler.ReceiveAwaitableInstance;
                 var bytesReceived = await _receiver.ReceiveAsync(buffer);
 
                 if (bytesReceived == 0)
@@ -244,6 +248,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
                 var isCompleted = result.IsCompleted;
                 if (!buffer.IsEmpty)
                 {
+                    await _scheduler.SendAwaitableInstance;
                     await _sender.SendAsync(buffer);
                 }
 
@@ -253,6 +258,136 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
                 {
                     break;
                 }
+            }
+        }
+    }
+
+    internal sealed class SocketScheduler
+    {
+        private static readonly WaitCallback _doWorkCallback = s => ((SocketScheduler)s).DoWork();
+        private readonly ConcurrentQueue<Action> _sendWorkItems = new ConcurrentQueue<Action>();
+        private readonly ConcurrentQueue<Action> _receiveWorkItems = new ConcurrentQueue<Action>();
+        private readonly object _workSync = new object();
+        private bool _doingWork;
+
+        public SocketScheduler()
+        {
+            SendAwaitableInstance = new SendAwaitable(this);
+            ReceiveAwaitableInstance = new ReceiveAwaitable(this);
+
+            // CONSIDER: Don't know if scheduling this is necessary in this model.
+            IOCompletionScheduler = new IOQueue();
+        }
+
+        public PipeScheduler IOCompletionScheduler { get; }
+
+        public SendAwaitable SendAwaitableInstance { get; }
+        public ReceiveAwaitable ReceiveAwaitableInstance { get; }
+
+        public void ScheduleSend(Action action)
+        {
+            _sendWorkItems.Enqueue(action);
+
+            lock (_workSync)
+            {
+                if (!_doingWork)
+                {
+                    System.Threading.ThreadPool.QueueUserWorkItem(_doWorkCallback, this);
+                    _doingWork = true;
+                }
+            }
+        }
+
+        public void ScheduleReceive(Action action)
+        {
+            _receiveWorkItems.Enqueue(action);
+
+            lock (_workSync)
+            {
+                if (!_doingWork)
+                {
+                    System.Threading.ThreadPool.QueueUserWorkItem(_doWorkCallback, this);
+                    _doingWork = true;
+                }
+            }
+        }
+
+        private void DoWork()
+        {
+            while (true)
+            {
+                while (_sendWorkItems.TryDequeue(out Action action))
+                {
+                    action();
+                }
+
+                while (_receiveWorkItems.TryDequeue(out Action action))
+                {
+                    action();
+                }
+
+                lock (_workSync)
+                {
+                    if (_sendWorkItems.IsEmpty && _receiveWorkItems.IsEmpty)
+                    {
+                        _doingWork = false;
+                        return;
+                    }
+                }
+            }
+        }
+
+        public class SendAwaitable : ICriticalNotifyCompletion
+        {
+            private readonly SocketScheduler _socketScheduler;
+
+            public SendAwaitable(SocketScheduler socketScheduler)
+            {
+                _socketScheduler = socketScheduler;
+            }
+
+            public SendAwaitable GetAwaiter() => this;
+            public bool IsCompleted => false;
+
+            public void GetResult()
+            {
+            }
+
+            public void OnCompleted(Action continuation)
+            {
+                UnsafeOnCompleted(continuation);
+            }
+
+            public void UnsafeOnCompleted(Action continuation)
+            {
+                _socketScheduler.ScheduleSend(continuation);
+            }
+        }
+
+        public class ReceiveAwaitable : ICriticalNotifyCompletion
+        {
+            private readonly SocketScheduler _socketScheduler;
+
+            public ReceiveAwaitable(SocketScheduler socketScheduler)
+            {
+                _socketScheduler = socketScheduler;
+            }
+
+            public ReceiveAwaitable GetAwaiter() => this;
+            public bool IsCompleted => false;
+
+            public void GetResult()
+            {
+            }
+
+            public void OnCompleted(Action continuation)
+            {
+                UnsafeOnCompleted(continuation);
+            }
+
+            public void UnsafeOnCompleted(Action continuation)
+            {
+                _socketScheduler.ScheduleReceive(continuation);
             }
         }
     }

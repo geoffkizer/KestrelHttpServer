@@ -27,7 +27,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets
         private readonly IConnectionDispatcher _dispatcher;
         private readonly IApplicationLifetime _appLifetime;
         private readonly int _numSchedulers;
-        private readonly PipeScheduler[] _schedulers;
+        private readonly SocketScheduler[] _schedulers;
         private readonly ISocketsTrace _trace;
         private Socket _listenSocket;
         private Task _listenTask;
@@ -55,17 +55,19 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets
             if (ioQueueCount > 0)
             {
                 _numSchedulers = ioQueueCount;
-                _schedulers = new IOQueue[_numSchedulers];
+                _schedulers = new SocketScheduler[_numSchedulers];
 
                 for (var i = 0; i < _numSchedulers; i++)
                 {
-                    _schedulers[i] = new IOQueue();
+                    _schedulers[i] = new SocketScheduler();
                 }
             }
             else
             {
-                _numSchedulers = ThreadPoolSchedulerArray.Length;
-                _schedulers = ThreadPoolSchedulerArray;
+                // When does this happen?
+                throw new InvalidOperationException($"ioQueueCount == {ioQueueCount} ??");
+//                _numSchedulers = ThreadPoolSchedulerArray.Length;
+//                _schedulers = ThreadPoolSchedulerArray;
             }
         }
 
