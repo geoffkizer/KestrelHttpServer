@@ -53,7 +53,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
             RemotePort = remoteEndPoint.Port;
 
             // On *nix platforms, Sockets already dispatches to the ThreadPool.
-            var awaiterScheduler = IsWindows ? _scheduler.IOCompletionScheduler : PipeScheduler.Inline;
+//            var awaiterScheduler = IsWindows ? _scheduler.IOCompletionScheduler : PipeScheduler.Inline;
+            var awaiterScheduler = PipeScheduler.Inline;
 
             _receiver = new SocketReceiver(_socket, awaiterScheduler);
             _sender = new SocketSender(_socket, awaiterScheduler);
